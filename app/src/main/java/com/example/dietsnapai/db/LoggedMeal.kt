@@ -20,6 +20,9 @@ interface MealDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMeal(meal: LoggedMeal)
 
+    @Delete
+    suspend fun deleteMeal(meal: LoggedMeal)
+
     @Query("SELECT * FROM logged_meals ORDER BY timestamp DESC")
     fun getAllMeals(): Flow<List<LoggedMeal>>
 

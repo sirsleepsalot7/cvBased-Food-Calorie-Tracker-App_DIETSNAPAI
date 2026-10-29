@@ -3,10 +3,13 @@ package com.example.dietsnapai.ml
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
 import android.util.Log
+import java.io.ByteArrayInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -86,47 +89,62 @@ object ImageUtils {
     /**
      * Loads an image from a Content URI, corrects EXIF orientation, and extracts
      * a 1:1 centered square crop to preserve optical calibration with YOLO and Depth models.
+     * Uses Android ImageDecoder on API 28+ and single-stream readBytes fallback for maximum reliability.
      */
     fun loadSquareBitmapFromUri(context: Context, uri: Uri): Bitmap? {
+        // Strategy 1: Modern ImageDecoder (API 28+) handles EXIF, hardware color spaces, and SAF URIs natively
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                val source = ImageDecoder.createSource(context.contentResolver, uri)
+                val decodedBitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    decoder.isMutableRequired = true
+                    val maxDim = maxOf(info.size.width, info.size.height)
+                    if (maxDim > 1600) {
+                        val scale = 1280f / maxDim
+                        val targetW = (info.size.width * scale).toInt().coerceAtLeast(1)
+                        val targetH = (info.size.height * scale).toInt().coerceAtLeast(1)
+                        decoder.setTargetSize(targetW, targetH)
+                    }
+                }
+
+                val minDim = minOf(decodedBitmap.width, decodedBitmap.height)
+                val cropX = (decodedBitmap.width - minDim) / 2
+                val cropY = (decodedBitmap.height - minDim) / 2
+                val square = Bitmap.createBitmap(decodedBitmap, cropX, cropY, minDim, minDim)
+                if (square != decodedBitmap) {
+                    decodedBitmap.recycle()
+                }
+                val finalBitmap = if (square.config != Bitmap.Config.ARGB_8888) {
+                    val copy = square.copy(Bitmap.Config.ARGB_8888, false)
+                    square.recycle()
+                    copy ?: square
+                } else {
+                    square
+                }
+                return finalBitmap
+            } catch (e: Exception) {
+                Log.w("DietSnapAI", "ImageDecoder failed, falling back to byte stream: ${e.message}")
+            }
+        }
+
+        // Strategy 2: Single-stream readBytes fallback (reads stream ONCE to prevent SAF permission revocation)
         return try {
-            // 1. Read bounds to prevent OutOfMemory on high-res camera photos
-            val boundsOptions = BitmapFactory.Options().apply {
-                inJustDecodeBounds = true
-            }
-            context.contentResolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, boundsOptions)
+            val bytes = context.contentResolver.openInputStream(uri)?.use { stream ->
+                stream.readBytes()
             } ?: return null
 
-            val origWidth = boundsOptions.outWidth
-            val origHeight = boundsOptions.outHeight
-            if (origWidth <= 0 || origHeight <= 0) return null
+            if (bytes.isEmpty()) return null
 
-            // Calculate sample size to keep max dimension ~1280px (optimal for 640x640 model while saving RAM)
-            val maxTargetDim = 1280
-            var sampleSize = 1
-            val maxDim = maxOf(origWidth, origHeight)
-            while ((maxDim / sampleSize) > maxTargetDim * 1.5) {
-                sampleSize *= 2
-            }
-
-            // 2. Decode the sampled bitmap
-            val decodeOptions = BitmapFactory.Options().apply {
-                inSampleSize = sampleSize
-                inPreferredConfig = Bitmap.Config.ARGB_8888
-            }
-            val sampledBitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, decodeOptions)
-            } ?: return null
-
-            // 3. Read EXIF orientation to correct rotated phone photos
+            // 1. Read EXIF orientation from the byte array
             val orientation = try {
-                context.contentResolver.openInputStream(uri)?.use { stream ->
-                    val exif = ExifInterface(stream)
+                ByteArrayInputStream(bytes).use { bais ->
+                    val exif = ExifInterface(bais)
                     exif.getAttributeInt(
                         ExifInterface.TAG_ORIENTATION,
                         ExifInterface.ORIENTATION_NORMAL
                     )
-                } ?: ExifInterface.ORIENTATION_NORMAL
+                }
             } catch (e: Exception) {
                 ExifInterface.ORIENTATION_NORMAL
             }
@@ -138,6 +156,31 @@ object ImageUtils {
                 else -> 0f
             }
 
+            // 2. Decode bounds to determine sample size
+            val boundsOptions = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
+
+            val origWidth = boundsOptions.outWidth
+            val origHeight = boundsOptions.outHeight
+            if (origWidth <= 0 || origHeight <= 0) return null
+
+            val maxTargetDim = 1280
+            var sampleSize = 1
+            val maxDim = maxOf(origWidth, origHeight)
+            while ((maxDim / sampleSize) > maxTargetDim * 1.5) {
+                sampleSize *= 2
+            }
+
+            // 3. Decode the actual sampled bitmap from byte array
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val sampledBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions) ?: return null
+
+            // 4. Rotate according to EXIF
             val rotatedBitmap = if (rotationDegrees != 0f) {
                 val matrix = Matrix().apply { postRotate(rotationDegrees) }
                 val rotated = Bitmap.createBitmap(sampledBitmap, 0, 0, sampledBitmap.width, sampledBitmap.height, matrix, true)
@@ -149,7 +192,7 @@ object ImageUtils {
                 sampledBitmap
             }
 
-            // 4. Center-crop to 1:1 square to maintain camera metric scaling
+            // 5. Center-crop to 1:1 square
             val minDim = minOf(rotatedBitmap.width, rotatedBitmap.height)
             val cropX = (rotatedBitmap.width - minDim) / 2
             val cropY = (rotatedBitmap.height - minDim) / 2
@@ -158,9 +201,17 @@ object ImageUtils {
                 rotatedBitmap.recycle()
             }
 
-            squareBitmap
+            val finalBitmap = if (squareBitmap.config != Bitmap.Config.ARGB_8888) {
+                val copy = squareBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                squareBitmap.recycle()
+                copy ?: squareBitmap
+            } else {
+                squareBitmap
+            }
+
+            finalBitmap
         } catch (e: Exception) {
-            Log.e("DietSnapAI", "Failed to load image from URI", e)
+            Log.e("DietSnapAI", "Failed to load image from URI: ${e.message}", e)
             null
         }
     }
