@@ -6,10 +6,12 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.RectF
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -18,7 +20,10 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.view.LifecycleCameraController
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -28,7 +33,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -58,7 +65,9 @@ data class FoodDetectionItem(
     val estimatedCalories: Int,
     val confidence: Float,
     val macros: MacroResult,
-    val boundingBox: RectF
+    val boundingBox: RectF,
+    val isOccluded: Boolean = false,
+    val occlusionRatio: Float = 0f
 )
 
 data class NutritionResult(
@@ -180,37 +189,26 @@ class MainActivity : ComponentActivity() {
                 val depthBuffer = ImageUtils.bitmapToDepthFloatBuffer(bitmap)
                 val depthMap = engine.estimateDepth(depthBuffer)
 
-                // 5. Process each detected food item
-                val detectedFoodItems = foodCandidates.map { candidate ->
+                // 5. Process all detected food items simultaneously with full multi-fruit & occlusion awareness
+                val safeDepth = depthMap ?: Array(0) { FloatArray(0) }
+                val sceneResults = VolumeEstimator.processScene(safeDepth, foodCandidates, intrinsics)
+
+                val detectedFoodItems = sceneResults.map { sceneItem ->
+                    val candidate = sceneItem.candidate
+                    val volumeResult = sceneItem.volumeResult
                     val profile = FoodNutritionRepository.getNutritionalProfile(candidate.className)
-
-                    val volume = if (depthMap != null) {
-                        val scale = 518f / 640f
-                        val scaledBox = RectF(
-                            candidate.box.left * scale,
-                            candidate.box.top * scale,
-                            candidate.box.right * scale,
-                            candidate.box.bottom * scale
-                        )
-                        VolumeEstimator.computePhysicalVolume(depthMap, scaledBox, mmPerPixel, candidate.className)
-                    } else {
-                        val boxWidthMm = candidate.box.width() * mmPerPixel
-                        val boxHeightMm = candidate.box.height() * mmPerPixel
-                        val estimatedAreaMm2 = boxWidthMm * boxHeightMm * 0.50f
-                        val estimatedHeightMm = minOf(boxWidthMm, boxHeightMm) * 0.65f
-                        (estimatedAreaMm2 * estimatedHeightMm) / 1000f
-                    }
-
-                    val macros = FoodNutritionRepository.calculateMacroBreakdown(profile, volume)
+                    val macros = FoodNutritionRepository.calculateMacroBreakdown(profile, volumeResult.volumeCm3)
 
                     FoodDetectionItem(
                         foodName = profile.name,
                         className = candidate.className,
-                        volumeCm3 = volume,
+                        volumeCm3 = volumeResult.volumeCm3,
                         estimatedCalories = macros.calories,
                         confidence = candidate.confidence,
                         macros = macros,
-                        boundingBox = candidate.box
+                        boundingBox = candidate.box,
+                        isOccluded = volumeResult.isOccluded,
+                        occlusionRatio = volumeResult.occlusionRatio
                     )
                 }
 
@@ -293,9 +291,32 @@ fun CameraScreen(
     onDismissCardClicked: () -> Unit
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val controller = remember {
         LifecycleCameraController(context).apply {
             cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        }
+    }
+
+    // State for uploaded gallery image
+    var uploadedImageBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
+    // Launcher for selecting an image from the gallery
+    val galleryLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                val bitmap = ImageUtils.loadSquareBitmapFromUri(context, uri)
+                withContext(Dispatchers.Main) {
+                    if (bitmap != null) {
+                        uploadedImageBitmap = bitmap
+                        onAnalyzeClicked(bitmap)
+                    } else {
+                        Toast.makeText(context, "Could not load selected image", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
         }
     }
 
@@ -314,6 +335,45 @@ fun CameraScreen(
             },
             modifier = Modifier.fillMaxSize()
         )
+
+        // 1b. Display Uploaded Image when selected from gallery
+        if (uploadedImageBitmap != null) {
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                val squareSide = minOf(maxWidth, maxHeight)
+                Image(
+                    bitmap = uploadedImageBitmap!!.asImageBitmap(),
+                    contentDescription = "Uploaded Food Image",
+                    modifier = Modifier.size(squareSide),
+                    contentScale = ContentScale.Fit
+                )
+            }
+        }
+
+        // Return to Live Camera Button (Top-Left) when viewing an uploaded photo
+        if (uploadedImageBitmap != null) {
+            Button(
+                onClick = {
+                    uploadedImageBitmap = null
+                    onDismissCardClicked()
+                },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 48.dp, start = 16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF1E1E1E).copy(alpha = 0.85f),
+                    contentColor = Color.White
+                ),
+                shape = RoundedCornerShape(20.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Text(text = "📷 Live Camera", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
 
         // 2. History Toggle Button (Top-Right)
         IconButton(
@@ -334,21 +394,34 @@ fun CameraScreen(
         }
 
         // 3. Bounding Box Canvas Overlay for all detected food items with uniform aspect ratio scaling
+        val itemColorPalette = remember {
+            listOf(
+                Color(0xFFFFD600), // Yellow (Banana)
+                Color(0xFFFF5252), // Red (Apple)
+                Color(0xFFFF9100), // Orange
+                Color(0xFF00E676), // Green
+                Color(0xFF00B0FF), // Blue
+                Color(0xFFE040FB)  // Purple
+            )
+        }
+
         result?.allDetectedFoods?.let { foods ->
             Canvas(modifier = Modifier.fillMaxSize()) {
-                val scale = size.width / 640f
-                val viewHeight = 640f * scale
-                val offsetY = (size.height - viewHeight) / 2f
+                val squareSide = minOf(size.width, size.height)
+                val offsetX = (size.width - squareSide) / 2f
+                val offsetY = (size.height - squareSide) / 2f
+                val scale = squareSide / 640f
 
-                foods.forEach { food ->
+                foods.forEachIndexed { index, food ->
+                    val color = itemColorPalette[index % itemColorPalette.size]
                     val box = food.boundingBox
-                    val left = box.left * scale
+                    val left = box.left * scale + offsetX
                     val top = box.top * scale + offsetY
-                    val width = box.width() * scale
-                    val height = box.height() * scale
+                    val width = (box.right - box.left) * scale
+                    val height = (box.bottom - box.top) * scale
 
                     drawRect(
-                        color = Color(0xFF00E676),
+                        color = color,
                         topLeft = Offset(left, top),
                         size = Size(width, height),
                         style = Stroke(width = 6f)
@@ -360,9 +433,10 @@ fun CameraScreen(
         // 4. Nutrition & Macro Breakdown Card
         result?.let { data ->
             val foodTitle = if (data.allDetectedFoods.size == 1) {
-                data.primaryFood.foodName
+                val occ = if (data.primaryFood.isOccluded) " (Partially Occluded)" else ""
+                "${data.primaryFood.foodName}$occ"
             } else {
-                "${data.allDetectedFoods.size} Detected Items"
+                "${data.allDetectedFoods.size} Food Items Detected"
             }
 
             Card(
@@ -455,19 +529,33 @@ fun CameraScreen(
                         HorizontalDivider(color = Color.DarkGray)
                         Spacer(modifier = Modifier.height(8.dp))
 
-                        data.allDetectedFoods.forEach { item ->
+                        data.allDetectedFoods.forEachIndexed { index, item ->
+                            val color = itemColorPalette[index % itemColorPalette.size]
+                            val occludedBadge = if (item.isOccluded) " (occluded)" else ""
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 2.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
+                                    .padding(vertical = 3.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = "• ${item.foodName}",
-                                    color = Color.LightGray,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Medium
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(50),
+                                        color = color,
+                                        modifier = Modifier.size(8.dp)
+                                    ) {}
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "${item.foodName}$occludedBadge",
+                                        color = Color.LightGray,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
                                 Text(
                                     text = "${item.macros.weightGrams.toInt()}g (${"%.0f".format(Locale.US, item.volumeCm3)} cm³) — ${item.estimatedCalories} kcal",
                                     color = Color(0xFFFFCC80),
@@ -526,58 +614,142 @@ fun CameraScreen(
             }
         }
 
-        // 5. Capture Button Controls
+        // 5. Controls (Capture / Gallery / Status)
         Card(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(24.dp)
+                .padding(20.dp)
                 .fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.75f))
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.82f))
         ) {
             Column(
                 modifier = Modifier.padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Button(
-                    onClick = {
-                        if (!isProcessing) {
-                            controller.takePicture(
-                                ContextCompat.getMainExecutor(context),
-                                object : ImageCapture.OnImageCapturedCallback() {
-                                    override fun onCaptureSuccess(image: ImageProxy) {
-                                        val rotationDegrees = image.imageInfo.rotationDegrees
-                                        val rawBitmap = image.toBitmap()
-                                        val rotatedBitmap = if (rotationDegrees != 0) {
-                                            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-                                            Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
-                                        } else {
-                                            rawBitmap
-                                        }
-                                        onAnalyzeClicked(rotatedBitmap)
-                                        image.close()
-                                    }
-
-                                    override fun onError(exception: ImageCaptureException) {
-                                        Log.e("DietSnapAI", "Capture failed", exception)
-                                    }
-                                }
-                            )
-                        }
-                    },
-                    enabled = !isProcessing,
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                ) {
-                    if (isProcessing) {
+                if (isProcessing) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         CircularProgressIndicator(
-                            color = Color.White,
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp
+                            color = Color(0xFF64B5F6),
+                            modifier = Modifier.size(22.dp),
+                            strokeWidth = 2.5.dp
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Estimating Volume & Macros...")
-                    } else {
-                        Text("Capture & Analyze Food")
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Estimating Volume & Macros...",
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                } else if (uploadedImageBitmap != null) {
+                    // Controls when viewing an uploaded photo
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                uploadedImageBitmap = null
+                                onDismissCardClicked()
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = Color.White,
+                                containerColor = Color.White.copy(alpha = 0.08f)
+                            ),
+                            border = BorderStroke(1.dp, Color(0xFF78909C))
+                        ) {
+                            Text("📷 Live Camera", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        Button(
+                            onClick = {
+                                galleryLauncher.launch("image/*")
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        ) {
+                            Text("🖼️ New Photo", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                } else {
+                    // Controls when in live camera mode
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = {
+                                controller.takePicture(
+                                    ContextCompat.getMainExecutor(context),
+                                    object : ImageCapture.OnImageCapturedCallback() {
+                                        override fun onCaptureSuccess(image: ImageProxy) {
+                                            val rotationDegrees = image.imageInfo.rotationDegrees
+                                            val rawBitmap = image.toBitmap()
+                                            val rotatedBitmap = if (rotationDegrees != 0) {
+                                                val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                                                Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+                                            } else {
+                                                rawBitmap
+                                            }
+
+                                            // Crucial: Square center-crop before AI inference to preserve 1:1 metric scale!
+                                            val minDim = minOf(rotatedBitmap.width, rotatedBitmap.height)
+                                            val cropX = (rotatedBitmap.width - minDim) / 2
+                                            val cropY = (rotatedBitmap.height - minDim) / 2
+                                            val squareBitmap = Bitmap.createBitmap(rotatedBitmap, cropX, cropY, minDim, minDim)
+
+                                            uploadedImageBitmap = null
+                                            onAnalyzeClicked(squareBitmap)
+                                            image.close()
+                                        }
+
+                                        override fun onError(exception: ImageCaptureException) {
+                                            Log.e("DietSnapAI", "Capture failed", exception)
+                                        }
+                                    }
+                                )
+                            },
+                            modifier = Modifier
+                                .weight(1.3f)
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        ) {
+                            Text("📸 Capture", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                galleryLauncher.launch("image/*")
+                            },
+                            modifier = Modifier
+                                .weight(1.1f)
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = Color.White,
+                                containerColor = Color.White.copy(alpha = 0.08f)
+                            ),
+                            border = BorderStroke(1.dp, Color(0xFF64B5F6))
+                        ) {
+                            Text("🖼️ Gallery", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        }
                     }
                 }
             }

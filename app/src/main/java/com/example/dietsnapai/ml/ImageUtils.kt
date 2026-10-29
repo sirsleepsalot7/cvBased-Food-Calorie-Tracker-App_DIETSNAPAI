@@ -1,6 +1,12 @@
 package com.example.dietsnapai.ml
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
+import android.net.Uri
+import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -75,5 +81,87 @@ object ImageUtils {
 
         floatBuffer.rewind()
         return floatBuffer
+    }
+
+    /**
+     * Loads an image from a Content URI, corrects EXIF orientation, and extracts
+     * a 1:1 centered square crop to preserve optical calibration with YOLO and Depth models.
+     */
+    fun loadSquareBitmapFromUri(context: Context, uri: Uri): Bitmap? {
+        return try {
+            // 1. Read bounds to prevent OutOfMemory on high-res camera photos
+            val boundsOptions = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, boundsOptions)
+            } ?: return null
+
+            val origWidth = boundsOptions.outWidth
+            val origHeight = boundsOptions.outHeight
+            if (origWidth <= 0 || origHeight <= 0) return null
+
+            // Calculate sample size to keep max dimension ~1280px (optimal for 640x640 model while saving RAM)
+            val maxTargetDim = 1280
+            var sampleSize = 1
+            val maxDim = maxOf(origWidth, origHeight)
+            while ((maxDim / sampleSize) > maxTargetDim * 1.5) {
+                sampleSize *= 2
+            }
+
+            // 2. Decode the sampled bitmap
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val sampledBitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
+            } ?: return null
+
+            // 3. Read EXIF orientation to correct rotated phone photos
+            val orientation = try {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    val exif = ExifInterface(stream)
+                    exif.getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION,
+                        ExifInterface.ORIENTATION_NORMAL
+                    )
+                } ?: ExifInterface.ORIENTATION_NORMAL
+            } catch (e: Exception) {
+                ExifInterface.ORIENTATION_NORMAL
+            }
+
+            val rotationDegrees = when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+
+            val rotatedBitmap = if (rotationDegrees != 0f) {
+                val matrix = Matrix().apply { postRotate(rotationDegrees) }
+                val rotated = Bitmap.createBitmap(sampledBitmap, 0, 0, sampledBitmap.width, sampledBitmap.height, matrix, true)
+                if (rotated != sampledBitmap) {
+                    sampledBitmap.recycle()
+                }
+                rotated
+            } else {
+                sampledBitmap
+            }
+
+            // 4. Center-crop to 1:1 square to maintain camera metric scaling
+            val minDim = minOf(rotatedBitmap.width, rotatedBitmap.height)
+            val cropX = (rotatedBitmap.width - minDim) / 2
+            val cropY = (rotatedBitmap.height - minDim) / 2
+            val squareBitmap = Bitmap.createBitmap(rotatedBitmap, cropX, cropY, minDim, minDim)
+            if (squareBitmap != rotatedBitmap) {
+                rotatedBitmap.recycle()
+            }
+
+            squareBitmap
+        } catch (e: Exception) {
+            Log.e("DietSnapAI", "Failed to load image from URI", e)
+            null
+        }
     }
 }

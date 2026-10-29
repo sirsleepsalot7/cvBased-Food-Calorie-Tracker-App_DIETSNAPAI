@@ -50,6 +50,10 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
         compose = true
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     // Prevents Gradle from compressing ONNX models inside the APK
     androidResources {
         noCompress += listOf("onnx")
